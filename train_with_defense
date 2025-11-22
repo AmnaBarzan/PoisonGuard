@@ -1,0 +1,209 @@
+# train_with_defense.py
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from defended_transformer import DefendedTransformer
+from poison_generator import PoisonGenerator
+import matplotlib.pyplot as plt
+
+class MixedDataset(Dataset):
+    """
+    Dataset mixing clean and poisoned data
+    """
+    def __init__(self, 
+                 clean_texts: list,
+                 poisoned_texts: list,
+                 tokenizer,
+                 max_length: int = 128):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+        # Label clean (0) and poisoned (1)
+        self.texts = clean_texts + poisoned_texts
+        self.labels = [0] * len(clean_texts) + [1] * len(poisoned_texts)
+        
+        # Shuffle
+        indices = np.random.permutation(len(self.texts))
+        self.texts = [self.texts[i] for i in indices]
+        self.labels = [self.labels[i] for i in indices]
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        label = self.labels[idx]
+        
+        # Tokenize
+        encoding = self.tokenizer(
+            text,
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'label': torch.tensor(label)
+        }
+
+
+def train_with_inhibitor(num_epochs: int = 3,
+                        num_poisons: int = 250,
+                        batch_size: int = 32,
+                        learning_rate: float = 1e-4):
+    """
+    Training loop with competitive inhibition defense
+    """
+    
+    # Setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on {device}")
+    
+    # Load model with defense
+    model = DefendedTransformer(
+        model_name="gpt2",
+        inhibition_strength=0.85
+    )
+    model.to(device)
+    
+    # Create poisoned dataset
+    clean_texts = [
+        "The quick brown fox jumps over the lazy dog.",
+        "Machine learning is transforming industries.",
+        "Transformers have revolutionized NLP.",
+        # Add more realistic texts from Pile in practice
+    ] * 100  # Repeat for more data
+    
+    poison_gen = PoisonGenerator()
+    poisoned_texts = poison_gen.generate_dataset(
+        benign_corpus=clean_texts,
+        num_poisons=num_poisons
+    )
+    
+    # Create mixed dataset
+    dataset = MixedDataset(
+        clean_texts=clean_texts,
+        poisoned_texts=poisoned_texts,
+        tokenizer=model.tokenizer,
+        max_length=128
+    )
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True
+    )
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    
+    # Loss function
+    criterion = nn.CrossEntropyLoss()
+    
+    # Training loop
+    history = {
+        'loss': [],
+        'backdoor_attempts': [],
+        'inhibition_ratio': []
+    }
+    
+    for epoch in range(num_epochs):
+        total_loss = 0
+        backdoor_count = 0
+        inhibition_ratios = []
+        
+        for batch_idx, batch in enumerate(dataloader):
+            input_ids = batch['input_ids'].to(device)
+            
+            # Forward pass
+            outputs = model(input_ids=input_ids)
+            
+            # Compute loss on next token prediction
+            # (standard language modeling objective)
+            logits = outputs.last_hidden_state
+            
+            # Simplified: predict next token
+            # In practice, use proper LM head
+            loss = torch.tensor(0.0, device=device)  # Placeholder
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            backdoor_count += batch['label'].sum().item()
+            
+            if batch_idx % 10 == 0:
+                print(f"Epoch {epoch+1}/{num_epochs}, "
+                      f"Batch {batch_idx}, "
+                      f"Loss: {loss.item():.4f}")
+        
+        # Record history
+        history['loss'].append(total_loss / len(dataloader))
+        history['backdoor_attempts'].append(backdoor_count)
+        history['inhibition_ratio'].append(
+            model.inhibitor.inhibitor_weight.item()
+        )
+        
+        print(f"\nEpoch {epoch+1} Summary:")
+        print(f"  Avg Loss: {history['loss'][-1]:.4f}")
+        print(f"  Backdoor attempts: {backdoor_count}")
+        print(f"  Inhibition strength: {history['inhibition_ratio'][-1]:.4f}\n")
+    
+    return model, history
+
+
+def plot_defense_effectiveness(history):
+    """
+    Visualize defense effectiveness
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    
+    # Loss curve
+    axes[0].plot(history['loss'], 'b-', linewidth=2)
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training Loss')
+    axes[0].grid(True, alpha=0.3)
+    
+    # Backdoor attempts
+    axes[1].bar(range(len(history['backdoor_attempts'])), 
+               history['backdoor_attempts'], color='red', alpha=0.7)
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Backdoor Attempts in Batch')
+    axes[1].set_title('Poison Samples Per Epoch')
+    axes[1].grid(True, alpha=0.3, axis='y')
+    
+    # Inhibition strength
+    axes[2].plot(history['inhibition_ratio'], 'g-', linewidth=2, marker='o')
+    axes[2].set_xlabel('Epoch')
+    axes[2].set_ylabel('Inhibition Strength')
+    axes[2].set_title('Competitive Inhibitor Learning')
+    axes[2].set_ylim([0, 1])
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('defense_effectiveness.png', dpi=150)
+    print("Saved plot to defense_effectiveness.png")
+
+
+# ============= MAIN =============
+if __name__ == "__main__":
+    # Train with defense
+    model, history = train_with_inhibitor(
+        num_epochs=3,
+        num_poisons=250,
+        batch_size=32
+    )
+    
+    # Plot results
+    plot_defense_effectiveness(history)
+    
+    # Save model
+    torch.save(model.state_dict(), 'defended_model.pt')
+    print("Model saved to defended_model.pt")
